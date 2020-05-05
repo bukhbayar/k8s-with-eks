@@ -1,0 +1,190 @@
+name: k8s cluster with github actions
+on:
+  push:
+    branches:
+      - staging
+jobs:
+  build-images:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup SSH Keys
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.g_SECRET_PUBLIC_KEY }}" > ~/.ssh/github.pub
+          echo "${{ secrets.g_SECRET_PRIVATE_KEY }}" > ~/.ssh/github
+          echo "${{ secrets.g_CONFIG }}" > ~/.ssh/config
+          chmod 644 ~/.ssh/github.pub
+          chmod 600 ~/.ssh/github
+          chmod 644 ~/.ssh/config
+      - name: Clone API repo
+        run: |
+          git clone --branch production --single-branch git@github.com:bukhbayar/k8s-api.git
+          cd k8s-api/
+          git checkout tags/v1.2
+          cd ..
+          pwd
+      - name: Clone APP repo
+        run: |
+          git clone --branch production --single-branch git@github.com:bukhbayar/k8s-frontend.git
+          cd k8s-frontend/
+          git checkout tags/v1.2
+          cd ..
+      - name: Build Docker image for API
+        run: |
+          docker build -t k8s-api:v1.2 -f docker-api/Dockerfile .
+      - name: Build Docker image for APP
+        run: |
+          docker build -t k8s-app:v1.2 -f docker-app/Dockerfile .
+      - name: Setup awscli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+          mkdir -p ~/.aws
+          echo "[default]
+          aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region = ${{ secrets.AWS_REGION }}" > ~/.aws/credentials
+      - name: AWS ECR login
+        run: |
+          aws ecr get-login-password \
+            --region ap-southeast-1 \
+            | docker login \
+            --username AWS \
+            --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com
+      - name: Setup ECR repo for k8s-api
+        run: |
+          export REPO_NAME=$(aws ecr describe-repositories | jq -r '.repositories[].repositoryName' | grep 'k8s-api')
+          if [ "$REPO_NAME" != "k8s-api" ]; then
+            aws ecr create-repository \
+              --repository-name k8s-api \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE \
+              --region ap-southeast-1
+          else
+            echo "ECR repo for k8s-api has been created!"
+          fi
+      - name: Setup ECR repo for k8s-app
+        run: |
+          export REPO_NAME=$(aws ecr describe-repositories | jq -r '.repositories[].repositoryName' | grep 'k8s-app')
+          if [ "$REPO_NAME" != "k8s-app" ]; then
+            aws ecr create-repository \
+              --repository-name k8s-app \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE \
+              --region ap-southeast-1
+          else
+            echo "ECR repo for k8s-app has been created!"
+          fi
+      - name: Push k8s-api docker image to ECR repo
+        run: |
+          export IMAGE_TAG=$(aws ecr describe-images --repository-name k8s-api | jq -r '.imageDetails[].imageTags[]' | grep 'v1.2')
+          if [ "$IMAGE_TAG" != "v1.2" ]; then
+            docker tag k8s-api:v1.2 ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/k8s-api:v1.2
+            docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/k8s-api:v1.2
+          else
+            echo "k8s-api docker image has been pushed!"
+          fi
+      - name: Push k8s-app docker image to ECR repo
+        run: |
+          export IMAGE_TAG=$(aws ecr describe-images --repository-name k8s-app | jq -r '.imageDetails[].imageTags[]' | grep 'v1.2')
+          if [ "$IMAGE_TAG" != "v1.2" ]; then
+            docker tag k8s-app:v1.2 ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/k8s-app:v1.2
+            docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/k8s-app:v1.2
+          else
+            echo "k8s-app docker image has been pushed!"
+          fi
+  build-cluster:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup eks
+        run: |
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/download/latest_release/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+      - name: Setup kubectl
+        run: |
+          curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+      - name: Setup awscli
+        run: |
+          sudo apt-get update
+          sudo apt-get install python3-setuptools
+          pip3 install wheel
+          pip3 install awscli
+      - name: Setup SSH Keys
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.k8S_SECRET_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          echo "${{ secrets.k8S_SECRET_PUBLIC_KEY }}" > ~/.ssh/id_rsa.pub
+      - name: "Building k8s cluster"
+        run: |
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          export KOPS_CLUSTER_NAME=api.data3.xyz
+          export KOPS_STATE_STORE=s3://api-data3-xyz-state-store
+          export EXISTING_CLUSTER_NAME=$(kops get cluster --name ${KOPS_CLUSTER_NAME} | cut -f1 | grep ${KOPS_CLUSTER_NAME})
+          echo ${EXISTING_CLUSTER_NAME}
+          if [[ ${EXISTING_CLUSTER_NAME} != ${KOPS_CLUSTER_NAME} ]] || [[ ! -n ${EXISTING_CLUSTER_NAME} ]]; then
+            kops create cluster \
+              --cloud aws \
+              --name ${KOPS_CLUSTER_NAME} \
+              --master-size t2.micro \
+              --node-size t2.micro \
+              --node-count 3 \
+              --state ${KOPS_STATE_STORE} \
+              --dns-zone ${KOPS_CLUSTER_NAME} \
+              --zones ap-southeast-1a \
+              --yes
+            export READY_NODES=""
+            export TOTAL_READY_NODES=0
+            echo " Waiting cluster ... "
+            sleep 60
+            while [ ${TOTAL_READY_NODES} -lt 4 ]
+            do
+              echo "Cluster is getting ready ... "
+              sleep 10
+              export READY_NODES=$(kubectl get nodes -o json | jq '.items[].status.conditions[].type | match("Ready") | .string')
+              export TOTAL_READY_NODES=$(echo ${READY_NODES} | wc -w | sed 's/ //g')
+            done
+          else
+            echo "${KOPS_CLUSTER_NAME} cluster has been created!"
+          fi
+  deployment:
+    runs-on: ubuntu-18.04
+    needs: [build-images, build-cluster]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup kops
+        run: |
+          curl -Lo kops https://github.com/kubernetes/kops/releases/download/$(curl -s https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name | cut -d '"' -f 4)/kops-linux-amd64
+          chmod +x ./kops
+          sudo mv ./kops /usr/local/bin/
+      - name: Setup kubectl
+        run: |
+          curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+      - name: Setup awscli
+        run: |
+          sudo apt-get update
+          sudo apt-get install python3-setuptools
+          pip3 install wheel
+          pip3 install awscli
+      - name: Setup SSH Keys
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.k8S_SECRET_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          echo "${{ secrets.k8S_SECRET_PUBLIC_KEY }}" > ~/.ssh/id_rsa.pub
+      - name: "Deploying manifests to the cluster"
+        run: |
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          export KOPS_STATE_STORE=s3://api-data3-xyz-state-store
+          echo ' Start deploying mafiest files ... '
+          kops export kubecfg --name=api.data3.xyz
+          kops validate cluster
+          kubectl apply -f ./manifests/deployment.yml
+          kubectl apply -f ./manifests/service.yml
