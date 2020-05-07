@@ -5,4 +5,5 @@ Testing K8s cluster with EKS on AWS
 - Self Healing
 - High Availability
 - Auto Scaling
+- Horisontal Scaling
 ...

@@ -27,6 +27,9 @@ spec:
         - name: data3-api-container
           image: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com/k8s-api:v1.2
           resources:
+            limits:
+              cpu: 300m
+              memory: 512Mi
             requests:
               cpu: 300m
               memory: 512Mi

@@ -111,3 +111,5 @@ jobs:
           kubectl -n kube-system annotate deployment.apps/cluster-autoscaler cluster-autoscaler.kubernetes.io/safe-to-evict="false" --overwrite
           kubectl apply -f manifests/deployment.yml
           kubectl apply -f manifests/service.yml
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.3.6/components.yaml
+          kubectl apply -f manifests/hpa.yml
